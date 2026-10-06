@@ -12,6 +12,30 @@ export interface WorldBuildCheckpoint {
   signature: string;
   digests: Record<string, unknown>;
   updatedAt: string;
+  events?: WorldBuildEvent[];
+  stage?: WorldBuildEventStage;
+  status?: WorldBuildEventStatus;
+  contextWindowTokens?: number;
+  totalBatches?: number;
+  completedBatches?: number;
+  estimatedTotalTokens?: number;
+}
+
+export type WorldBuildEventStage = 'reading' | 'synthesizing' | 'complete';
+export type WorldBuildEventStatus = 'preparing' | 'requesting' | 'retrying' | 'validating' | 'saving' | 'saved' | 'synthesizing' | 'complete' | 'failed';
+
+export interface WorldBuildEvent {
+  at: string;
+  stage: WorldBuildEventStage;
+  status: WorldBuildEventStatus;
+  batchNumber?: number;
+  chapterLabel?: string;
+  attempt?: number;
+  maxAttempts?: number;
+  estimatedTokens?: number;
+  timeoutMs?: number;
+  durationMs?: number;
+  errorCode?: string;
 }
 
 function requestValue<T>(request: IDBRequest<T>): Promise<T> {

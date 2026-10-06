@@ -17,6 +17,30 @@ function readFileBytes(file: File): Promise<ArrayBuffer> {
   });
 }
 
+function formatMarkdownPreview(source: string): string {
+  return source
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/<(script|style)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<br\s*\/?\s*>/gi, ' ')
+    .replace(/<\/(?:div|p|li|h[1-6]|blockquote|section|article)>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/^\s{0,3}#{1,6}\s+/gm, '')
+    .replace(/^\s*>\s?/gm, '')
+    .replace(/^\s*(?:[-*+]\s+|\d+[.)]\s+)/gm, '')
+    .replace(/^\s*(?:-{3,}|\*{3,}|_{3,})\s*$/gm, '')
+    .replace(/[*_~`]/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&amp;/gi, '&')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export default function NovelImport({ onBack, onContinue }: NovelImportProps) {
   const fileRef = useRef<HTMLInputElement>(null);
   const [novel, setNovel] = useState<ParsedNovel>();
@@ -44,6 +68,7 @@ export default function NovelImport({ onBack, onContinue }: NovelImportProps) {
   };
 
   const excerpt = novel?.chapters[0]?.excerpts[0]?.text ?? '';
+  const excerptPreview = novel?.filename.toLowerCase().endsWith('.md') ? formatMarkdownPreview(excerpt) : excerpt;
 
   return (
     <main className="setup-shell import-shell">
@@ -68,7 +93,7 @@ export default function NovelImport({ onBack, onContinue }: NovelImportProps) {
               <div className="novel-file-copy"><strong>{novel.title}</strong><span>{novel.chapters.length} 个章节 · {novel.charCount.toLocaleString()} 字符 · {novel.filename}</span></div>
               <button type="button" className="icon-button" aria-label="移除小说" onClick={() => setNovel(undefined)}><X size={17} /></button>
             </div>
-            <div className="chapter-preview"><span>第一章 · {novel.chapters[0]?.title}</span><p>{excerpt.slice(0, 260)}{excerpt.length > 260 ? '…' : ''}</p></div>
+            <div className="chapter-preview"><span>第一章 · {novel.chapters[0]?.title}</span><p>{excerptPreview.slice(0, 260)}{excerptPreview.length > 260 ? '…' : ''}</p></div>
             <div className="local-check"><Check size={15} /> 章节与文字编码在本机识别 · 建世界时整本小说会分批发送给你选择的模型</div>
           </section>
         )}

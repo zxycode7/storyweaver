@@ -2,22 +2,25 @@ import { useState, type FormEvent } from 'react';
 import { ArrowLeft, ArrowRight, Eye, EyeOff, KeyRound, ShieldCheck, Sparkles, Wifi } from 'lucide-react';
 import { verifyConnection, type ModelConfig } from '../ai/client';
 import { isLoopbackPage } from '../ai/localProxy';
+import { CONTEXT_WINDOW_OPTIONS, DEFAULT_CONTEXT_WINDOW_TOKENS } from '../ai/tokenEstimate';
 
 interface ProviderSetupProps {
   onBack: () => void;
   onConnected: (config: ModelConfig) => void;
+  initialContextWindowTokens?: number;
 }
 
 const PROVIDERS = [
-  { label: 'OpenAI', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini' },
-  { label: 'DeepSeek', url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
-  { label: '自定义接口', url: '', model: '' },
+  { label: 'OpenAI', url: 'https://api.openai.com/v1', model: 'gpt-4o-mini', contextWindowTokens: 128_000 },
+  { label: 'DeepSeek', url: 'https://api.deepseek.com/v1', model: 'deepseek-chat', contextWindowTokens: 128_000 },
+  { label: '自定义接口', url: '', model: '', contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS },
 ];
 
-export default function ProviderSetup({ onBack, onConnected }: ProviderSetupProps) {
+export default function ProviderSetup({ onBack, onConnected, initialContextWindowTokens }: ProviderSetupProps) {
   const [baseUrl, setBaseUrl] = useState('');
   const [model, setModel] = useState('');
   const [apiKey, setApiKey] = useState('');
+  const [contextWindowTokens, setContextWindowTokens] = useState(initialContextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS);
   const [useLocalProxy, setUseLocalProxy] = useState(() => typeof window !== 'undefined' && isLoopbackPage(window.location.origin));
   const [reveal, setReveal] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -26,12 +29,13 @@ export default function ProviderSetup({ onBack, onConnected }: ProviderSetupProp
   const pick = (provider: typeof PROVIDERS[number]) => {
     setBaseUrl(provider.url);
     setModel(provider.model);
+    setContextWindowTokens(provider.contextWindowTokens);
   };
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     setError('');
-    const config = { baseUrl: baseUrl.trim(), model: model.trim(), apiKey: apiKey.trim(), transport: useLocalProxy ? 'local-proxy' as const : 'direct' as const };
+    const config = { baseUrl: baseUrl.trim(), model: model.trim(), apiKey: apiKey.trim(), contextWindowTokens, transport: useLocalProxy ? 'local-proxy' as const : 'direct' as const };
     setTesting(true);
     try {
       await verifyConnection(config);
@@ -62,6 +66,12 @@ export default function ProviderSetup({ onBack, onConnected }: ProviderSetupProp
           </label>
           <label className="field-label">模型名称
             <input required value={model} onChange={(event) => setModel(event.target.value)} placeholder="例如 gpt-4o-mini" />
+          </label>
+          <label className="field-label">模型上下文窗口
+            <select value={contextWindowTokens} onChange={(event) => setContextWindowTokens(Number(event.target.value))}>
+              {CONTEXT_WINDOW_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+            </select>
+            <small className="field-hint">按模型服务商公布的上限选择；每批最多使用约 75%，当前单批最多发送约 256k token，给系统指令、结果和估算误差预留空间。</small>
           </label>
           <label className="field-label">API 密钥
             <span className="password-field">

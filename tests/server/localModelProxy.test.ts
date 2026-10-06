@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import { describe, expect, it, vi } from 'vitest';
 import { localModelProxy } from '../../server/localModelProxy';
 
-function makeRequest() {
+function makeRequest(body = '{"model":"test-model"}', timeoutMs?: number) {
   const request = new EventEmitter() as IncomingMessage & AsyncIterable<Buffer>;
   Object.assign(request, {
     url: '/__local_model_proxy', method: 'POST',
@@ -11,8 +11,9 @@ function makeRequest() {
       origin: 'http://127.0.0.1:5173', host: '127.0.0.1:5173',
       'x-model-endpoint': 'https://api.example.test/v1/chat/completions',
       'x-model-api-key': 'private-key-123', 'x-model-name': 'test-model',
+      ...(timeoutMs ? { 'x-model-timeout-ms': String(timeoutMs) } : {}),
     },
-    async *[Symbol.asyncIterator]() { yield Buffer.from('{"model":"test-model"}'); },
+    async *[Symbol.asyncIterator]() { yield Buffer.from(body); },
   });
   return request;
 }
@@ -33,6 +34,28 @@ function makeResponse() {
 }
 
 describe('local model proxy transport failures', () => {
+  it('accepts large long-context requests above the former 256 KiB limit', async () => {
+    const body = `{"novel":"${'x'.repeat(300 * 1024)}"}`;
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      status: 200, headers: new Headers({ 'content-type': 'application/json' }), body: null,
+    }));
+    const response = makeResponse();
+
+    await localModelProxy()(makeRequest(body), response, vi.fn());
+
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(response.statusCode).toBe(200);
+  });
+
+  it('honors a bounded timeout for long-context upstream requests', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ status: 200, headers: new Headers(), body: null }));
+    const timerSpy = vi.spyOn(globalThis, 'setTimeout');
+
+    await localModelProxy()(makeRequest(undefined, 480_000), makeResponse(), vi.fn());
+
+    expect(timerSpy).toHaveBeenCalledWith(expect.any(Function), 480_000);
+  });
+
   it('destroys a response that fails after upstream headers instead of ending it as success', async () => {
     const reader = {
       read: vi.fn().mockResolvedValueOnce({ done: false, value: new TextEncoder().encode('{"choices":') })

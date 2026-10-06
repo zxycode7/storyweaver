@@ -1,6 +1,7 @@
 import type { NovelExcerpt, ParsedNovel } from '../domain/novel';
 import type { StoryArchive } from '../domain/story';
 import type { WorldModel } from '../domain/world';
+import { DEFAULT_CONTEXT_WINDOW_TOKENS, estimateModelTokens, getWorldBatchTokenBudget } from './tokenEstimate';
 
 export interface SourceExcerptContext {
   id: string;
@@ -29,9 +30,39 @@ export function buildWorldExtractPrompt(novel: ParsedNovel, excerpts: SourceExce
 
 export const WORLD_SYNTHESIS_SYSTEM = `你是小说玩法设计师。把整本小说的资料摘要组织成一个符合这本书的互动故事模型，不得套用固定游戏类型。人物、关系、原著事件必须使用提供的资料和 excerpt id；允许的玩法状态只保留少量真正影响选择的变量，不要强行加入战斗或数值。每个玩法状态必须引用它首次有依据的原文片段；起点建议只选有引用证据的章节。面向玩家的 premise、tone 和 narrativeDrivers 必须是不暴露结局、身份反转或后期关键事件的无剧透描述。角色 summary 只能描述该角色在 firstChapter 时已经公开的信息。返回 JSON: {"premise":"...","tone":"...","narrativeDrivers":["..."],"trackedStates":[{"id":"lower_snake_case","label":"...","description":"...","initialValue":0,"min":0,"max":5,"citations":["excerpt-id"]}],"startSuggestions":[{"chapterNumber":1,"label":"...","reason":"..."}]}. 最多 8 个驱动、8 个状态和 6 个起点。`;
 
-export function buildWorldSynthesisPrompt(novel: ParsedNovel, digests: ChunkDigest[]): string {
-  const summary = digests.map((digest, index) => `批次 ${index + 1}: ${JSON.stringify(digest)}`).join('\n');
-  return `为《${novel.title}》建立玩法模型。系统已读取全部 ${novel.chapters.length} 章，但产出的简介、叙事驱动力和角色初始简介必须无剧透；后期事实保留在按故事时间检索的资料中，不要把它们写进玩家可见的概览。起点建议可以来自任意章节。只基于下面资料作判断，没有证据的内容不要补成正史。\n\n${summary}`;
+function compactSynthesisDigest(digest: ChunkDigest): Record<string, unknown> {
+  return {
+    premise: digest.premiseSignal.slice(0, 120),
+    tone: digest.toneNotes.slice(0, 2).map((item) => item.slice(0, 50)),
+    drivers: digest.narrativeDrivers.slice(0, 2).map((item) => item.slice(0, 70)),
+    characters: digest.characters.slice(0, 3).map(({ name, summary, citations }) => ({ name, summary: summary.slice(0, 100), source: citations[0] })),
+    facts: digest.facts.slice(0, 4).map(({ text, kind, chapterNumber, citations }) => ({ text: text.slice(0, 120), kind, chapter: chapterNumber, source: citations[0] })),
+    relationships: digest.relationships.slice(0, 2).map(({ characterNames, description, citations }) => ({ people: characterNames, relation: description.slice(0, 80), source: citations[0] })),
+    timeline: digest.timeline.slice(0, 3).map(({ description, chapterNumber, citations }) => ({ event: description.slice(0, 100), chapter: chapterNumber, source: citations[0] })),
+  };
+}
+
+function evenlySample<T>(items: T[], count: number): T[] {
+  if (count >= items.length) return items;
+  if (count <= 1) return [items[0]];
+  return Array.from({ length: count }, (_, index) => items[Math.round(index * (items.length - 1) / (count - 1))]);
+}
+
+export function buildWorldSynthesisPrompt(
+  novel: ParsedNovel,
+  digests: ChunkDigest[],
+  maxInputTokens = getWorldBatchTokenBudget(DEFAULT_CONTEXT_WINDOW_TOKENS),
+): string {
+  const base = `为《${novel.title}》建立玩法模型。系统已读取全部 ${novel.chapters.length} 章。下面是按全书顺序整理的压缩代表性摘要，可能只保留部分批次线索；摘要引用 ID 可用于 trackedStates。产出的简介、叙事驱动力和角色初始简介必须无剧透；后期事实保留在按故事时间检索的资料中，不要把它们写进玩家可见的概览。起点建议可以来自任意章节。只基于下面资料作判断，没有证据的内容不要补成正史。`;
+  const indexed = digests.map((digest, index) => ({ index, digest: compactSynthesisDigest(digest) }));
+  const render = (items: typeof indexed) => `${base}\n\n${items.map(({ index, digest }) => `批次 ${index + 1}: ${JSON.stringify(digest)}`).join('\n')}`;
+  let selected = indexed;
+  let prompt = render(selected);
+  while (selected.length > 2 && estimateModelTokens(prompt) > maxInputTokens) {
+    selected = evenlySample(selected, Math.max(2, Math.floor(selected.length * 0.75)));
+    prompt = render(selected);
+  }
+  return prompt;
 }
 
 export function turnSystemPrompt(): string {

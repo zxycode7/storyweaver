@@ -5,26 +5,52 @@ import NovelImport from './components/NovelImport';
 import StoryPlay from './components/StoryPlay';
 import StorySetup from './components/StorySetup';
 import WorldReview from './components/WorldReview';
-import { buildWorld, createWorldBatches, type WorldBuildProgress } from './ai/worldBuilder';
+import { buildWorld, countReusableWorldBuildBatches, createWorldBatches, type WorldBuildProgress } from './ai/worldBuilder';
 import { ModelRequestError, type ModelConfig } from './ai/client';
 import { MAX_NOVEL_BYTES, MAX_NOVEL_SIZE_LABEL, parseNovelText, type ParsedNovel } from './domain/novel';
 import { createStoryArchive, type StoryArchive, type StorySetup as StorySetupData } from './domain/story';
 import type { WorldModel } from './domain/world';
-import { StoryRepository } from './storage/storyRepository';
+import { StoryRepository, type WorldBuildCheckpoint, type WorldBuildEvent } from './storage/storyRepository';
 import { importArchive, type ImportedStoryBundle } from './storage/archiveFormat';
 import { validateWorldModel } from './domain/world';
 import { decodeNovelBytes } from './domain/encoding';
+import { getWorldBatchTokenBudget } from './ai/tokenEstimate';
 
 type View = 'home' | 'provider' | 'import' | 'consent' | 'building' | 'review' | 'story-setup' | 'play';
 interface LibraryItem { archive: StoryArchive; novelTitle: string }
-interface PendingBuildItem { novelId: string; novelTitle: string; filename: string; completedBatches: number; totalBatches: number; updatedAt: string }
+interface PendingBuildItem { novelId: string; novelTitle: string; filename: string; completedBatches: number; totalBatches: number; updatedAt: string; lastEvent?: WorldBuildEvent }
 const repository = new StoryRepository();
+
+function restoreBuildProgress(novel: ParsedNovel, checkpoint: WorldBuildCheckpoint | undefined, contextWindowTokens?: number): WorldBuildProgress {
+  const batches = checkpoint?.totalBatches === undefined || checkpoint.estimatedTotalTokens === undefined ? createWorldBatches(novel, contextWindowTokens) : undefined;
+  const completed = checkpoint?.completedBatches ?? countReusableWorldBuildBatches(novel, checkpoint?.digests ?? {}, contextWindowTokens);
+  const latestEvent = checkpoint?.events?.at(-1);
+  const latestFailure = latestEvent?.status === 'failed' ? latestEvent : undefined;
+  return {
+    completed, total: (checkpoint?.totalBatches ?? batches?.length ?? 0) + 1,
+    stage: checkpoint?.stage === 'synthesizing' ? 'synthesizing' : checkpoint?.stage === 'complete' ? 'complete' : 'reading',
+    status: checkpoint?.status ?? 'preparing', resumed: completed, chapterCount: novel.chapters.length, startedAt: Date.now(),
+    estimatedTotalTokens: checkpoint?.estimatedTotalTokens ?? batches?.reduce((sum, batch) => sum + batch.estimatedTokens, 0) ?? 0,
+    events: checkpoint?.events ?? [],
+    ...(latestFailure?.batchNumber ? { errorCode: latestFailure.errorCode, failedBatch: { number: latestFailure.batchNumber, chapterLabel: latestFailure.chapterLabel ?? '未知批次', errorCode: latestFailure.errorCode ?? 'unknown' } } : {}),
+  };
+}
+
+function buildEventLabel(event: WorldBuildEvent): string {
+  const status: Record<WorldBuildEvent['status'], string> = {
+    preparing: '准备任务', requesting: '请求模型', retrying: '等待重试', validating: '校验回复',
+    saving: '写入检查点', saved: '检查点已保存', synthesizing: '全书汇总', complete: '生成完成', failed: '失败',
+  };
+  const location = event.batchNumber ? `第 ${event.batchNumber} 批 · ${event.chapterLabel ?? ''}` : event.chapterLabel ?? '';
+  return [location, status[event.status]].filter(Boolean).join(' · ');
+}
 
 export default function App() {
   const [view, setView] = useState<View>('home');
   const [config, setConfig] = useState<ModelConfig>();
   const [pendingStoryId, setPendingStoryId] = useState<string>();
   const [pendingBuildNovelId, setPendingBuildNovelId] = useState<string>();
+  const [pendingBuildContextWindowTokens, setPendingBuildContextWindowTokens] = useState<number>();
   const [novel, setNovel] = useState<ParsedNovel>();
   const [world, setWorld] = useState<WorldModel>();
   const [archive, setArchive] = useState<StoryArchive>();
@@ -52,7 +78,7 @@ export default function App() {
       const builds = await Promise.all(checkpoints.map(async (checkpoint) => {
         const savedNovel = await repository.getNovel(checkpoint.novelId);
         if (!savedNovel) return undefined;
-        return { novelId: savedNovel.id, novelTitle: savedNovel.title, filename: savedNovel.filename, completedBatches: Object.keys(checkpoint.digests ?? {}).length, totalBatches: createWorldBatches(savedNovel).length, updatedAt: checkpoint.updatedAt };
+        return { novelId: savedNovel.id, novelTitle: savedNovel.title, filename: savedNovel.filename, completedBatches: checkpoint.completedBatches ?? countReusableWorldBuildBatches(savedNovel, checkpoint.digests ?? {}, checkpoint.contextWindowTokens), totalBatches: checkpoint.totalBatches ?? createWorldBatches(savedNovel, checkpoint.contextWindowTokens).length, updatedAt: checkpoint.updatedAt, ...(checkpoint.events?.at(-1) ? { lastEvent: checkpoint.events.at(-1)! } : {}) };
       }));
       setLibrary(items);
       setPendingBuilds(builds.filter((build): build is PendingBuildItem => Boolean(build)));
@@ -65,7 +91,7 @@ export default function App() {
   useEffect(() => { void refreshLibrary(); }, [refreshLibrary]);
 
   const begin = () => {
-    setPendingStoryId(undefined); setFlowError(''); setNovel(undefined); setWorld(undefined); setArchive(undefined); setGuidance(''); setView('provider');
+    setPendingStoryId(undefined); setPendingBuildNovelId(undefined); setPendingBuildContextWindowTokens(undefined); setFlowError(''); setNovel(undefined); setWorld(undefined); setArchive(undefined); setGuidance(''); setView('provider');
   };
 
   const openSavedStory = async (id: string, activeConfig?: ModelConfig) => {
@@ -85,35 +111,50 @@ export default function App() {
       catch (cause) { setFlowError(cause instanceof Error ? cause.message : '无法打开这条故事线。'); setView('home'); }
     } else if (pendingBuildNovelId) {
       try {
-        const savedNovel = await repository.getNovel(pendingBuildNovelId);
+        const [savedNovel, checkpoint] = await Promise.all([repository.getNovel(pendingBuildNovelId), repository.getWorldBuildCheckpoint(`world-build-${pendingBuildNovelId}`)]);
         if (!savedNovel) throw new Error('找不到待继续整理的小说，请重新导入。');
-        setNovel(savedNovel); setPendingBuildNovelId(undefined); setFlowError(''); setProgress(undefined); setView('consent');
+        setNovel(savedNovel); setPendingBuildNovelId(undefined); setFlowError(''); setProgress(restoreBuildProgress(savedNovel, checkpoint, nextConfig.contextWindowTokens)); setView('consent');
       } catch (cause) { setFlowError(cause instanceof Error ? cause.message : '无法恢复这本小说。'); setView('home'); }
     } else setView('import');
   };
 
   const resumeBuild = async (novelId: string) => {
     try {
-      const savedNovel = await repository.getNovel(novelId);
+      const [savedNovel, checkpoint] = await Promise.all([repository.getNovel(novelId), repository.getWorldBuildCheckpoint(`world-build-${novelId}`)]);
       if (!savedNovel) throw new Error('找不到待继续整理的小说，请重新导入。');
-      setNovel(savedNovel); setPendingBuildNovelId(novelId); setFlowError(''); setView('provider');
+      setNovel(savedNovel); setPendingBuildNovelId(novelId); setPendingBuildContextWindowTokens(checkpoint?.contextWindowTokens); setFlowError(''); setView('provider');
     } catch (cause) { setFlowError(cause instanceof Error ? cause.message : '无法恢复这本小说。'); }
   };
 
-  const requestEstimate = useMemo(() => novel ? createWorldBatches(novel).length + 1 : 0, [novel]);
+  const buildEstimate = useMemo(() => {
+    if (!novel || !config) return { batches: 0, tokens: 0 };
+    const batches = createWorldBatches(novel, config.contextWindowTokens);
+    return { batches: batches.length, tokens: batches.reduce((sum, batch) => sum + batch.estimatedTokens, 0) };
+  }, [novel, config]);
+  const requestEstimate = novel && config ? buildEstimate.batches + 1 : 0;
 
   const analyzeNovel = async () => {
     if (!novel || !config) { setFlowError('请先导入小说并连接模型服务。'); return; }
     setFlowError(''); setProgress(undefined); setView('building');
     const controller = new AbortController(); buildAbort.current = controller;
+    let latestProgress: WorldBuildProgress | undefined;
     try {
       await repository.saveNovel(novel);
-      const nextWorld = await buildWorld(novel, config, setProgress, controller.signal, repository);
+      const nextWorld = await buildWorld(novel, config, (next) => { latestProgress = next; setProgress(next); }, controller.signal, repository);
       await repository.completeWorldBuild(nextWorld, `world-build-${novel.id}`);
       setWorld(nextWorld); setView('review');
     } catch (cause) {
       setFlowError(cause instanceof ModelRequestError && cause.code === 'cancelled' ? '已停止整理。已完成的批次已保留，之后可以继续。' : cause instanceof Error ? cause.message : '世界准备失败。');
-      setProgress((current) => current?.status === 'complete' ? { ...current, status: 'failed', errorCode: 'local-storage', failedBatch: { number: current.total, chapterLabel: '保存到本机', errorCode: 'local-storage' } } : current);
+      if (latestProgress?.status === 'complete') {
+        const errorCode = 'local-storage';
+        const event: WorldBuildEvent = { at: new Date().toISOString(), stage: 'complete', status: 'failed', batchNumber: latestProgress.total, chapterLabel: '保存到本机', errorCode };
+        const failedProgress: WorldBuildProgress = { ...latestProgress, status: 'failed', errorCode, failedBatch: { number: latestProgress.total, chapterLabel: '保存到本机', errorCode }, events: [...(latestProgress.events ?? []), event] };
+        setProgress(failedProgress);
+        try {
+          const checkpoint = await repository.getWorldBuildCheckpoint(`world-build-${novel.id}`);
+          if (checkpoint) await repository.saveWorldBuildCheckpoint({ ...checkpoint, stage: 'complete', status: 'failed', events: [...(checkpoint.events ?? []), event], updatedAt: event.at });
+        } catch { /* Keep the in-memory diagnostic when local storage itself is unavailable. */ }
+      }
       setView('consent');
     }
     finally { buildAbort.current = undefined; }
@@ -168,7 +209,7 @@ export default function App() {
 
   if (view === 'provider') return <>
     {flowError && <div className="global-notice" role="alert">{flowError}</div>}
-    <ProviderSetup onBack={() => { setPendingStoryId(undefined); setPendingBuildNovelId(undefined); setView('home'); }} onConnected={handleConnected} />
+    <ProviderSetup initialContextWindowTokens={pendingBuildContextWindowTokens} onBack={() => { setPendingStoryId(undefined); setPendingBuildNovelId(undefined); setPendingBuildContextWindowTokens(undefined); setView('home'); }} onConnected={handleConnected} />
   </>;
   if (view === 'import') return <NovelImport onBack={() => setView('provider')} onContinue={(parsed) => { setNovel(parsed); setFlowError(''); setView('consent'); }} />;
   if (view === 'consent' && novel && config) {
@@ -182,9 +223,10 @@ export default function App() {
         <p className="setup-intro">在建世界之前，先看清楚会发生什么。</p>
         <div className="consent-route"><span className="route-node local-node"><BookOpen size={18} /></span><span className="route-line" /><span className="route-node model-node"><Sparkles size={18} /></span><div className="route-labels"><span><strong>你的浏览器</strong><small>整本原文先在本机解析；所有章节留在本机存档。</small></span><span><strong>你选择的模型服务</strong><small>{config.baseUrl} · {config.model}</small></span></div></div>
         <div className="consent-scope"><div className="scope-icon"><BookOpenCheck size={17} /></div><div><strong>整本小说用于建立世界资料</strong><p>《{novel.title}》共 {novel.chapters.length} 章，会分批发送给你选择的模型服务。游玩时只会检索当前故事起点和进度内的内容；结局和后续事件不会在开局时提前带入。</p></div></div>
-        <div className="consent-details"><div><span>预计模型请求</span><strong>约 {requestEstimate} 次起</strong></div><p>小说越长，请求和费用通常越多；每批与全书汇总最多自动重试 2 次，极端情况下最多再增加约 {requestEstimate * 2} 次请求。若超时后服务商已处理但响应未送达，重试可能产生重复费用。实际费用由服务商单价决定。</p></div>
+        <div className="consent-details"><div><span>基础模型请求</span><strong>{requestEstimate} 次</strong></div><div><span>最坏尝试次数</span><strong>{requestEstimate * 3} 次</strong></div><div><span>估算输入规模</span><strong>约 {buildEstimate.tokens.toLocaleString()} tokens · 每批上限 {getWorldBatchTokenBudget(config.contextWindowTokens).toLocaleString()}</strong></div><p>批次会跨章节连续合并，最多同时处理 4 批；全书汇总会压缩线索以控制上下文。每个请求首次失败后最多再试 2 次，因此最坏情况是基础请求数的 3 倍。若服务商已处理但响应未送达，重试可能产生重复费用。</p></div>
         {flowError && <div className="inline-error" role="alert">{flowError}</div>}
         {progress?.failedBatch && <div className="build-resume-note" role="status"><strong>已保留 {savedBatchCount} / {Math.max(0, requestEstimate - 1)} 份整理结果</strong><span>上次停在{progress.failedBatch.chapterLabel}（第 {progress.failedBatch.number} 批，诊断码：{progress.failedBatch.errorCode}）。再次继续会跳过已完成的内容。</span></div>}
+        {progress?.events && progress.events.length > 0 && <div className="build-recovery-log" aria-label="最近运行记录">{progress.events.slice(-4).reverse().map((event, index) => <div key={`${event.at}-${index}`}><time>{new Date(event.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time><span>{buildEventLabel(event)}{event.errorCode ? ` · ${event.errorCode}` : ''}{event.estimatedTokens ? ` · ≈ ${event.estimatedTokens.toLocaleString()} tokens` : ''}{event.durationMs ? ` · ${(event.durationMs / 1_000).toFixed(1)} 秒` : ''}</span></div>)}</div>}
         <button className="primary-button full-button" type="button" onClick={analyzeNovel}>{savedBatchCount > 0 ? `从已保存的 ${savedBatchCount} 份继续` : '同意发送整本小说并建世界'} <ArrowRight size={17} /></button>
         <p className="consent-footnote">不继续也不会发送小说内容。Storyweaver 不接收你的原文或 API 密钥。</p>
       </section>
@@ -210,8 +252,9 @@ export default function App() {
       <div className="build-progress-label"><span>已完成 {Math.min(progress?.completed ?? 0, batchCount)} / {batchCount} 份章节整理{progress?.resumed ? ` · 恢复 ${progress.resumed} 份` : ''}</span><strong>{percent}%</strong></div>
       <div className="progress-track" role="progressbar" aria-label="世界整理进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><span style={{ width: `${percent}%` }} /></div>
       <div className="build-status-line" role="status" aria-live="polite"><span className={progress?.status === 'retrying' ? 'status-dot status-warn' : 'status-dot'} />{statusText}</div>
-      <div className="build-active-list">{activeBatches.map((batch) => <div className="build-active-row" key={batch.number}><strong>第 {batch.number} 批 · {batch.chapterLabel}</strong><span>{batch.status === 'retrying' ? `第 ${batch.attempt} 次失败（${batch.errorCode}），${Math.ceil((batch.retryDelayMs ?? 0) / 1_000)} 秒后重试` : batch.status === 'validating' ? '核对返回内容与引用' : batch.status === 'saving' ? '写入本机检查点' : `正在等待模型响应${batch.attempt ? ` · 尝试 ${batch.attempt}/${batch.maxAttempts}` : ''}`}</span></div>)}</div>
-      <div className="build-diagnostics"><span>运行时长 <strong>{elapsed}</strong></span><span>章节 <strong>{novel.chapters.length}</strong></span><span>同时处理 <strong>最多 2 批</strong></span></div>
+      <div className="build-active-list">{activeBatches.map((batch) => <div className="build-active-row" key={batch.number}><strong>第 {batch.number} 批 · {batch.chapterLabel}</strong><span>{batch.status === 'retrying' ? `第 ${batch.attempt} 次失败（${batch.errorCode}），${Math.ceil((batch.retryDelayMs ?? 0) / 1_000)} 秒后重试` : batch.status === 'validating' ? '核对返回内容与引用' : batch.status === 'saving' ? '写入本机检查点' : `正在等待模型响应 · 尝试 ${batch.attempt ?? 1}/${batch.maxAttempts ?? 3}`} · 约 ${batch.estimatedTokens?.toLocaleString() ?? '—'} tokens · 最长等待 ${Math.ceil((batch.timeoutMs ?? 180_000) / 60_000)} 分钟</span></div>)}</div>
+      {progress?.events && progress.events.length > 0 && <section className="build-event-log" aria-label="最近运行记录"><div className="build-log-heading">最近运行记录 <span>{progress.events.length} 条已保存</span></div>{progress.events.slice(-6).reverse().map((event, index) => <div className="build-log-event" key={`${event.at}-${event.batchNumber ?? 'summary'}-${index}`}><time>{new Date(event.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time><strong>{buildEventLabel(event)}</strong><span>{[event.attempt ? `尝试 ${event.attempt}/${event.maxAttempts ?? 3}` : '', event.estimatedTokens ? `≈ ${event.estimatedTokens.toLocaleString()} tokens` : '', event.timeoutMs ? `最长等待 ${Math.ceil(event.timeoutMs / 60_000)} 分钟` : '', event.durationMs ? `${(event.durationMs / 1_000).toFixed(1)} 秒` : '', event.errorCode ? `诊断码 ${event.errorCode}` : ''].filter(Boolean).join(' · ')}</span></div>)}</section>}
+      <div className="build-diagnostics"><span>运行时长 <strong>{elapsed}</strong></span><span>章节 <strong>{novel.chapters.length}</strong></span><span>章节输入估算 <strong>{progress?.estimatedTotalTokens?.toLocaleString() ?? '—'} tokens</strong></span><span>并发 <strong>最多 4 批</strong></span></div>
       <button className="quiet-button" type="button" onClick={() => buildAbort.current?.abort()}>停止并保留已完成部分</button>
     </div></main>;
   }
@@ -251,7 +294,7 @@ function Home({ library, pendingBuilds, error, flowError, onStart, onResumeBuild
         <span className="sparkle sparkle-a">✳</span><span className="sparkle sparkle-b">✳</span><span className="art-caption">01 — A STORY THAT REMEMBERS</span>
       </div>
     </section>
-    {pendingBuilds.length > 0 && <section className="library-section pending-build-section"><div className="section-title"><div><span className="eyebrow">PICK UP YOUR WORLD BUILD</span><h2>继续准备中的世界</h2></div></div><div className="library-grid">{pendingBuilds.map((build) => <button className="library-card pending-build-card" type="button" key={build.novelId} onClick={() => onResumeBuild(build.novelId)}><span className="library-cover"><BookOpenCheck size={19} /></span><span className="library-copy"><strong>继续整理《{build.novelTitle}》</strong><small>{build.filename}</small><em><Clock3 size={12} /> {build.completedBatches} 份已保存 · 共 {build.totalBatches} 份</em></span><ChevronRight size={17} /></button>)}</div></section>}
+    {pendingBuilds.length > 0 && <section className="library-section pending-build-section"><div className="section-title"><div><span className="eyebrow">PICK UP YOUR WORLD BUILD</span><h2>继续准备中的世界</h2></div></div><div className="library-grid">{pendingBuilds.map((build) => <button className="library-card pending-build-card" type="button" key={build.novelId} onClick={() => onResumeBuild(build.novelId)}><span className="library-cover"><BookOpenCheck size={19} /></span><span className="library-copy"><strong>继续整理《{build.novelTitle}》</strong><small>{build.filename}</small><em><Clock3 size={12} /> {build.completedBatches} 份已保存 · 共 {build.totalBatches} 份</em><small className="pending-build-status">{build.lastEvent ? buildEventLabel(build.lastEvent) + (build.lastEvent.errorCode ? ` · ${build.lastEvent.errorCode}` : '') : `检查点更新于 ${new Date(build.updatedAt).toLocaleString('zh-CN')}`}</small></span><ChevronRight size={17} /></button>)}</div></section>}
     {library.length > 0 && <section className="library-section"><div className="section-title"><div><span className="eyebrow">PICK UP WHERE YOU LEFT OFF</span><h2>你的故事</h2></div><button type="button" className="small-create-button" onClick={onStart}><Plus size={15} /> 新故事</button></div><div className="library-grid">{library.map(({ archive: saved, novelTitle }) => <button className="library-card" type="button" key={saved.id} onClick={() => onContinue(saved.id)}><span className="library-cover"><BookOpen size={19} /></span><span className="library-copy"><strong>{saved.title}</strong><small>{novelTitle} · {saved.player.name}</small><em><Clock3 size={12} /> {saved.worldTime} · {saved.turns.length} 个片段</em></span><ChevronRight size={17} /></button>)}</div></section>}
     <section className="promise-strip"><div><span className="promise-icon"><BookOpenCheck size={16} /></span><span><strong>不是统一模板</strong><small>AI 为这本书读出适合它的玩法</small></span></div><div><span className="promise-icon"><Sparkles size={16} /></span><span><strong>选择会留下痕迹</strong><small>人物和故事线持续记住你做过的事</small></span></div><div><span className="promise-icon"><ShieldCheck size={16} /></span><span><strong>你的小说，你的模型</strong><small>原文与密钥不经过 Storyweaver 服务器</small></span></div></section>
     <footer className="home-footer"><span>STORYWEAVER <i>·</i> 一个仍在生长的故事工具</span><span><Upload size={13} /> TXT / MD&nbsp; <i>·</i>&nbsp; {MAX_NOVEL_SIZE_LABEL} 上限&nbsp; <i>·</i>&nbsp; IndexedDB 本机存档&nbsp; <i>·</i>&nbsp; {library.length > 0 && <><Check size={12} /> {library.length} 条本机故事</>}</span></footer>

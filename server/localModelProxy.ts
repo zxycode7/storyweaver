@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Connect } from 'vite';
 import { isLoopbackPage, validateLocalProxyTarget } from '../src/ai/localProxy';
 
-const MAX_BODY_BYTES = 256 * 1024;
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
 const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 function reply(response: ServerResponse, status: number, message: string) {
@@ -16,7 +16,7 @@ async function readBody(request: IncomingMessage): Promise<string> {
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
     size += buffer.length;
-    if (size > MAX_BODY_BYTES) throw new Error('模型请求超过本机代理的 256 KiB 上限。');
+    if (size > MAX_BODY_BYTES) throw new Error('模型请求超过本机代理的 2 MiB 上限。');
     chunks.push(buffer);
   }
   return Buffer.concat(chunks).toString('utf8');
@@ -49,8 +49,13 @@ export function localModelProxy(): Connect.NextHandleFunction {
 
     const abortController = new AbortController();
     request.on('aborted', () => abortController.abort());
+    response.on('close', () => { if (!response.writableEnded) abortController.abort(); });
+    const requestedTimeout = Number(request.headers['x-model-timeout-ms']);
+    const timeoutMs = Number.isFinite(requestedTimeout) && requestedTimeout > 0
+      ? Math.min(630_000, Math.max(30_000, Math.ceil(requestedTimeout)))
+      : 210_000;
     let timedOut = false;
-    const timeout = setTimeout(() => { timedOut = true; abortController.abort(); }, 210_000);
+    const timeout = setTimeout(() => { timedOut = true; abortController.abort(); }, timeoutMs);
     try {
       const upstream = await fetch(target, {
         method: 'POST',

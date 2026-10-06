@@ -2,6 +2,7 @@ export interface ModelConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  contextWindowTokens?: number;
   transport?: 'direct' | 'local-proxy';
 }
 
@@ -149,7 +150,7 @@ export async function requestJson<T>(config: ModelConfig, request: JsonRequest):
         const response = await fetch(url, {
           method: 'POST',
           headers: useLocalProxy
-            ? { 'Content-Type': 'application/json', 'X-Model-Endpoint': directUrl, 'X-Model-Api-Key': config.apiKey, 'X-Model-Name': config.model }
+            ? { 'Content-Type': 'application/json', 'X-Model-Endpoint': directUrl, 'X-Model-Api-Key': config.apiKey, 'X-Model-Name': config.model, 'X-Model-Timeout-Ms': String(timeoutMs) }
             : { 'Content-Type': 'application/json', Authorization: `Bearer ${config.apiKey}` },
           body: JSON.stringify({
             model: config.model,
