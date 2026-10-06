@@ -2,7 +2,7 @@ import { useState, type FormEvent } from 'react';
 import { ArrowLeft, ArrowRight, Eye, EyeOff, KeyRound, ShieldCheck, Sparkles, Wifi } from 'lucide-react';
 import { verifyConnection, type ModelConfig } from '../ai/client';
 import { isLoopbackPage } from '../ai/localProxy';
-import { CONTEXT_WINDOW_OPTIONS, DEFAULT_CONTEXT_WINDOW_TOKENS } from '../ai/tokenEstimate';
+import { CONTEXT_WINDOW_OPTIONS, DEFAULT_CONTEXT_WINDOW_TOKENS, getWorldBatchTokenBudget } from '../ai/tokenEstimate';
 
 interface ProviderSetupProps {
   onBack: () => void;
@@ -71,7 +71,7 @@ export default function ProviderSetup({ onBack, onConnected, initialContextWindo
             <select value={contextWindowTokens} onChange={(event) => setContextWindowTokens(Number(event.target.value))}>
               {CONTEXT_WINDOW_OPTIONS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
             </select>
-            <small className="field-hint">按模型服务商公布的上限选择；每批最多使用约 75%，当前单批最多发送约 256k token，给系统指令、结果和估算误差预留空间。</small>
+            <small className="field-hint">按模型服务商公布的上限选择；当前单批最多发送约 {getWorldBatchTokenBudget(contextWindowTokens).toLocaleString()} token，给系统指令、JSON 结果和估算误差预留空间。</small>
           </label>
           <label className="field-label">API 密钥
             <span className="password-field">

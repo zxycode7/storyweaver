@@ -14,14 +14,20 @@ export interface JsonRequest {
   onProgress?: (event: JsonRequestProgressEvent) => void;
 }
 
+export interface ModelResponseDiagnostics {
+  finishReason?: string;
+  responseChars?: number;
+}
+
 export type ModelErrorCode = 'configuration' | 'authentication' | 'rate-limit' | 'server' | 'http' | 'network' | 'timeout' | 'cancelled' | 'malformed-response';
 
 export class ModelRequestError extends Error {
   constructor(
     message: string,
     readonly code: ModelErrorCode,
-    readonly retryable = ['rate-limit', 'server', 'network', 'timeout'].includes(code),
+    readonly retryable = ['rate-limit', 'server', 'network', 'timeout', 'malformed-response'].includes(code),
     readonly retryAfterMs?: number,
+    readonly diagnostics?: ModelResponseDiagnostics,
   ) {
     super(message);
     this.name = 'ModelRequestError';
@@ -38,8 +44,8 @@ export interface JsonRequestRetryOptions {
 
 export type JsonRequestProgressEvent =
   | { type: 'attempt-start'; attempt: number; maxAttempts: number }
-  | { type: 'attempt-failed'; attempt: number; maxAttempts: number; code: ModelErrorCode; retryable: boolean }
-  | { type: 'retry-scheduled'; attempt: number; maxAttempts: number; delayMs: number; code: ModelErrorCode };
+  | { type: 'attempt-failed'; attempt: number; maxAttempts: number; code: ModelErrorCode; retryable: boolean; diagnostics?: ModelResponseDiagnostics }
+  | { type: 'retry-scheduled'; attempt: number; maxAttempts: number; delayMs: number; code: ModelErrorCode; diagnostics?: ModelResponseDiagnostics };
 
 export function normalizeChatUrl(baseUrl: string): string {
   let parsed: URL;
@@ -61,33 +67,47 @@ export function normalizeChatUrl(baseUrl: string): string {
   return `${parsed.origin}${path}/chat/completions`;
 }
 
-function getMessageContent(payload: unknown): string {
+interface ModelMessageContent {
+  content: string;
+  finishReason?: string;
+}
+
+function getMessageContent(payload: unknown): ModelMessageContent {
   if (!payload || typeof payload !== 'object') throw new ModelRequestError('模型返回内容无法识别。', 'malformed-response');
   const choices = (payload as { choices?: unknown }).choices;
   if (!Array.isArray(choices) || !choices[0] || typeof choices[0] !== 'object') {
     throw new ModelRequestError('模型没有返回可用结果。', 'malformed-response');
   }
-  const message = (choices[0] as { message?: unknown }).message;
+  const choice = choices[0] as { message?: unknown; finish_reason?: unknown; finishReason?: unknown };
+  const message = choice.message;
   if (!message || typeof message !== 'object') throw new ModelRequestError('模型没有返回消息内容。', 'malformed-response');
   const content = (message as { content?: unknown }).content;
-  if (typeof content === 'string') return content;
+  const finishReason = typeof choice.finish_reason === 'string'
+    ? choice.finish_reason
+    : typeof choice.finishReason === 'string' ? choice.finishReason : undefined;
+  if (typeof content === 'string') return { content, finishReason };
   if (Array.isArray(content)) {
     const joined = content.flatMap((item) => item && typeof item === 'object' && typeof (item as { text?: unknown }).text === 'string' ? [(item as { text: string }).text] : []).join('\n');
-    if (joined) return joined;
+    if (joined) return { content: joined, finishReason };
   }
   throw new ModelRequestError('模型没有返回文本结果。', 'malformed-response');
 }
 
-function parseJsonContent<T>(content: string): T {
+function parseJsonContent<T>(content: string, finishReason?: string): T {
+  const diagnostics: ModelResponseDiagnostics = { finishReason, responseChars: content.length };
   const withoutFence = content.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
   const start = withoutFence.indexOf('{');
   const end = withoutFence.lastIndexOf('}');
-  if (start < 0 || end < start) throw new ModelRequestError('模型结果不是有效的 JSON。请重试或更换模型。', 'malformed-response');
+  if (start < 0 || end < start) throw new ModelRequestError('模型结果不是有效的 JSON。请重试或更换模型。', 'malformed-response', true, undefined, diagnostics);
   try {
     return JSON.parse(withoutFence.slice(start, end + 1)) as T;
   } catch {
-    throw new ModelRequestError('模型返回的 JSON 不完整。请重试或更换模型。', 'malformed-response');
+    throw new ModelRequestError('模型返回的 JSON 不完整。请重试或更换模型。', 'malformed-response', true, undefined, diagnostics);
   }
+}
+
+function isGrokModel(model: string): boolean {
+  return /grok/i.test(model);
 }
 
 function cancelledError(): ModelRequestError {
@@ -155,6 +175,7 @@ export async function requestJson<T>(config: ModelConfig, request: JsonRequest):
           body: JSON.stringify({
             model: config.model,
             temperature: 0.45,
+            ...(isGrokModel(config.model) ? { response_format: { type: 'json_object' }, max_tokens: 16_384 } : {}),
             messages: [
               { role: 'system', content: `${request.system}\n\nReturn exactly one valid JSON object, without markdown fences.` },
               { role: 'user', content: request.user },
@@ -174,10 +195,11 @@ export async function requestJson<T>(config: ModelConfig, request: JsonRequest):
         let payload: unknown;
         try { payload = await response.json(); }
         catch (error) {
-          if (error instanceof SyntaxError) throw new ModelRequestError('模型响应不是有效的 JSON。请重试或更换模型。', 'malformed-response', false);
+          if (error instanceof SyntaxError) throw new ModelRequestError('模型响应不是有效的 JSON。请重试或更换模型。', 'malformed-response', true);
           throw error;
         }
-        return parseJsonContent<T>(getMessageContent(payload));
+        const message = getMessageContent(payload);
+        return parseJsonContent<T>(message.content, message.finishReason);
       } catch (error) {
         if (error instanceof ModelRequestError) throw error;
         if (request.signal?.aborted) throw cancelledError();
@@ -189,11 +211,11 @@ export async function requestJson<T>(config: ModelConfig, request: JsonRequest):
       }
     } catch (error) {
       const modelError = error instanceof ModelRequestError ? error : new ModelRequestError('模型请求失败。', 'network', true);
-      reportProgress(request, { type: 'attempt-failed', attempt, maxAttempts, code: modelError.code, retryable: modelError.retryable });
+      reportProgress(request, { type: 'attempt-failed', attempt, maxAttempts, code: modelError.code, retryable: modelError.retryable, diagnostics: modelError.diagnostics });
       if (!modelError.retryable || attempt >= maxAttempts) throw modelError;
       const backoffMs = Math.min(maxDelayMs, baseDelayMs * (2 ** (attempt - 1)));
       const delayMs = Math.max(backoffMs, Math.min(60_000, modelError.retryAfterMs ?? 0));
-      reportProgress(request, { type: 'retry-scheduled', attempt, maxAttempts, delayMs, code: modelError.code });
+      reportProgress(request, { type: 'retry-scheduled', attempt, maxAttempts, delayMs, code: modelError.code, diagnostics: modelError.diagnostics });
       await waitBeforeRetry(delayMs, request.signal);
     }
   }

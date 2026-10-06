@@ -24,8 +24,7 @@ const repository = new StoryRepository();
 function restoreBuildProgress(novel: ParsedNovel, checkpoint: WorldBuildCheckpoint | undefined, contextWindowTokens?: number): WorldBuildProgress {
   const batches = checkpoint?.totalBatches === undefined || checkpoint.estimatedTotalTokens === undefined ? createWorldBatches(novel, contextWindowTokens) : undefined;
   const completed = checkpoint?.completedBatches ?? countReusableWorldBuildBatches(novel, checkpoint?.digests ?? {}, contextWindowTokens);
-  const latestEvent = checkpoint?.events?.at(-1);
-  const latestFailure = latestEvent?.status === 'failed' ? latestEvent : undefined;
+  const latestFailure = [...(checkpoint?.events ?? [])].reverse().find((event) => event.status === 'failed');
   return {
     completed, total: (checkpoint?.totalBatches ?? batches?.length ?? 0) + 1,
     stage: checkpoint?.stage === 'synthesizing' ? 'synthesizing' : checkpoint?.stage === 'complete' ? 'complete' : 'reading',
@@ -43,6 +42,15 @@ function buildEventLabel(event: WorldBuildEvent): string {
   };
   const location = event.batchNumber ? `第 ${event.batchNumber} 批 · ${event.chapterLabel ?? ''}` : event.chapterLabel ?? '';
   return [location, status[event.status]].filter(Boolean).join(' · ');
+}
+
+function buildEventDiagnostics(event: Pick<WorldBuildEvent, 'errorCode' | 'finishReason' | 'responseChars' | 'invalidCitationCount'>): string[] {
+  return [
+    event.errorCode ? `诊断码 ${event.errorCode}` : '',
+    event.finishReason ? `上游结束 ${event.finishReason}` : '',
+    event.responseChars !== undefined ? `返回 ${event.responseChars.toLocaleString()} 字符` : '',
+    event.invalidCitationCount ? `忽略越界引用 ${event.invalidCitationCount} 条` : '',
+  ].filter(Boolean);
 }
 
 export default function App() {
@@ -226,7 +234,7 @@ export default function App() {
         <div className="consent-details"><div><span>基础模型请求</span><strong>{requestEstimate} 次</strong></div><div><span>最坏尝试次数</span><strong>{requestEstimate * 3} 次</strong></div><div><span>估算输入规模</span><strong>约 {buildEstimate.tokens.toLocaleString()} tokens · 每批上限 {getWorldBatchTokenBudget(config.contextWindowTokens).toLocaleString()}</strong></div><p>批次会跨章节连续合并，最多同时处理 4 批；全书汇总会压缩线索以控制上下文。每个请求首次失败后最多再试 2 次，因此最坏情况是基础请求数的 3 倍。若服务商已处理但响应未送达，重试可能产生重复费用。</p></div>
         {flowError && <div className="inline-error" role="alert">{flowError}</div>}
         {progress?.failedBatch && <div className="build-resume-note" role="status"><strong>已保留 {savedBatchCount} / {Math.max(0, requestEstimate - 1)} 份整理结果</strong><span>上次停在{progress.failedBatch.chapterLabel}（第 {progress.failedBatch.number} 批，诊断码：{progress.failedBatch.errorCode}）。再次继续会跳过已完成的内容。</span></div>}
-        {progress?.events && progress.events.length > 0 && <div className="build-recovery-log" aria-label="最近运行记录">{progress.events.slice(-4).reverse().map((event, index) => <div key={`${event.at}-${index}`}><time>{new Date(event.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time><span>{buildEventLabel(event)}{event.errorCode ? ` · ${event.errorCode}` : ''}{event.estimatedTokens ? ` · ≈ ${event.estimatedTokens.toLocaleString()} tokens` : ''}{event.durationMs ? ` · ${(event.durationMs / 1_000).toFixed(1)} 秒` : ''}</span></div>)}</div>}
+        {progress?.events && progress.events.length > 0 && <div className="build-recovery-log" aria-label="最近运行记录">{progress.events.slice(-4).reverse().map((event, index) => <div key={`${event.at}-${index}`}><time>{new Date(event.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time><span>{buildEventLabel(event)}{buildEventDiagnostics(event).map((item) => ` · ${item}`).join('')}{event.estimatedTokens ? ` · ≈ ${event.estimatedTokens.toLocaleString()} tokens` : ''}{event.durationMs ? ` · ${(event.durationMs / 1_000).toFixed(1)} 秒` : ''}</span></div>)}</div>}
         <button className="primary-button full-button" type="button" onClick={analyzeNovel}>{savedBatchCount > 0 ? `从已保存的 ${savedBatchCount} 份继续` : '同意发送整本小说并建世界'} <ArrowRight size={17} /></button>
         <p className="consent-footnote">不继续也不会发送小说内容。Storyweaver 不接收你的原文或 API 密钥。</p>
       </section>
@@ -252,8 +260,8 @@ export default function App() {
       <div className="build-progress-label"><span>已完成 {Math.min(progress?.completed ?? 0, batchCount)} / {batchCount} 份章节整理{progress?.resumed ? ` · 恢复 ${progress.resumed} 份` : ''}</span><strong>{percent}%</strong></div>
       <div className="progress-track" role="progressbar" aria-label="世界整理进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><span style={{ width: `${percent}%` }} /></div>
       <div className="build-status-line" role="status" aria-live="polite"><span className={progress?.status === 'retrying' ? 'status-dot status-warn' : 'status-dot'} />{statusText}</div>
-      <div className="build-active-list">{activeBatches.map((batch) => <div className="build-active-row" key={batch.number}><strong>第 {batch.number} 批 · {batch.chapterLabel}</strong><span>{batch.status === 'retrying' ? `第 ${batch.attempt} 次失败（${batch.errorCode}），${Math.ceil((batch.retryDelayMs ?? 0) / 1_000)} 秒后重试` : batch.status === 'validating' ? '核对返回内容与引用' : batch.status === 'saving' ? '写入本机检查点' : `正在等待模型响应 · 尝试 ${batch.attempt ?? 1}/${batch.maxAttempts ?? 3}`} · 约 ${batch.estimatedTokens?.toLocaleString() ?? '—'} tokens · 最长等待 ${Math.ceil((batch.timeoutMs ?? 180_000) / 60_000)} 分钟</span></div>)}</div>
-      {progress?.events && progress.events.length > 0 && <section className="build-event-log" aria-label="最近运行记录"><div className="build-log-heading">最近运行记录 <span>{progress.events.length} 条已保存</span></div>{progress.events.slice(-6).reverse().map((event, index) => <div className="build-log-event" key={`${event.at}-${event.batchNumber ?? 'summary'}-${index}`}><time>{new Date(event.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time><strong>{buildEventLabel(event)}</strong><span>{[event.attempt ? `尝试 ${event.attempt}/${event.maxAttempts ?? 3}` : '', event.estimatedTokens ? `≈ ${event.estimatedTokens.toLocaleString()} tokens` : '', event.timeoutMs ? `最长等待 ${Math.ceil(event.timeoutMs / 60_000)} 分钟` : '', event.durationMs ? `${(event.durationMs / 1_000).toFixed(1)} 秒` : '', event.errorCode ? `诊断码 ${event.errorCode}` : ''].filter(Boolean).join(' · ')}</span></div>)}</section>}
+      <div className="build-active-list">{activeBatches.map((batch) => <div className="build-active-row" key={batch.number}><strong>第 {batch.number} 批 · {batch.chapterLabel}</strong><span>{batch.status === 'retrying' ? `第 ${batch.attempt} 次失败（${batch.errorCode}），${Math.ceil((batch.retryDelayMs ?? 0) / 1_000)} 秒后重试` : batch.status === 'validating' ? '核对返回内容与引用' : batch.status === 'saving' ? '写入本机检查点' : `正在等待模型响应 · 尝试 ${batch.attempt ?? 1}/${batch.maxAttempts ?? 3}`}{batch.finishReason ? ` · 上游结束 ${batch.finishReason}` : ''}{batch.responseChars !== undefined ? ` · 返回 ${batch.responseChars.toLocaleString()} 字符` : ''}{batch.invalidCitationCount ? ` · 忽略越界引用 ${batch.invalidCitationCount} 条` : ''} · 约 ${batch.estimatedTokens?.toLocaleString() ?? '—'} tokens · 最长等待 ${Math.ceil((batch.timeoutMs ?? 180_000) / 60_000)} 分钟</span></div>)}</div>
+      {progress?.events && progress.events.length > 0 && <section className="build-event-log" aria-label="最近运行记录"><div className="build-log-heading">最近运行记录 <span>{progress.events.length} 条已保存</span></div>{progress.events.slice(-6).reverse().map((event, index) => <div className="build-log-event" key={`${event.at}-${event.batchNumber ?? 'summary'}-${index}`}><time>{new Date(event.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })}</time><strong>{buildEventLabel(event)}</strong><span>{[event.attempt ? `尝试 ${event.attempt}/${event.maxAttempts ?? 3}` : '', event.estimatedTokens ? `≈ ${event.estimatedTokens.toLocaleString()} tokens` : '', event.timeoutMs ? `最长等待 ${Math.ceil(event.timeoutMs / 60_000)} 分钟` : '', event.durationMs ? `${(event.durationMs / 1_000).toFixed(1)} 秒` : '', ...buildEventDiagnostics(event)].filter(Boolean).join(' · ')}</span></div>)}</section>}
       <div className="build-diagnostics"><span>运行时长 <strong>{elapsed}</strong></span><span>章节 <strong>{novel.chapters.length}</strong></span><span>章节输入估算 <strong>{progress?.estimatedTotalTokens?.toLocaleString() ?? '—'} tokens</strong></span><span>并发 <strong>最多 4 批</strong></span></div>
       <button className="quiet-button" type="button" onClick={() => buildAbort.current?.abort()}>停止并保留已完成部分</button>
     </div></main>;

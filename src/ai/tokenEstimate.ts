@@ -8,7 +8,9 @@ export const CONTEXT_WINDOW_OPTIONS = [
   { label: '1M', value: 1_000_000 },
 ] as const;
 
-const MAX_INPUT_TOKENS = 256_000;
+// Keep room for system instructions, the model's JSON output, and tokenizer drift
+// even when a provider advertises a much larger context window.
+const MAX_INPUT_TOKENS = 192_000;
 
 export function estimateModelTokens(text: string): number {
   let estimate = 0;

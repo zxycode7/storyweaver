@@ -28,7 +28,7 @@ export function buildWorldExtractPrompt(novel: ParsedNovel, excerpts: SourceExce
   return `分析小说《${novel.title}》的指定原文片段。当前批次涉及第 ${chapterList} 章。不要为没出现在本批次的章节编造事实。人物简介只基于该人物在本批次中最早出现的内容。\n\n${sources}`;
 }
 
-export const WORLD_SYNTHESIS_SYSTEM = `你是小说玩法设计师。把整本小说的资料摘要组织成一个符合这本书的互动故事模型，不得套用固定游戏类型。人物、关系、原著事件必须使用提供的资料和 excerpt id；允许的玩法状态只保留少量真正影响选择的变量，不要强行加入战斗或数值。每个玩法状态必须引用它首次有依据的原文片段；起点建议只选有引用证据的章节。面向玩家的 premise、tone 和 narrativeDrivers 必须是不暴露结局、身份反转或后期关键事件的无剧透描述。角色 summary 只能描述该角色在 firstChapter 时已经公开的信息。返回 JSON: {"premise":"...","tone":"...","narrativeDrivers":["..."],"trackedStates":[{"id":"lower_snake_case","label":"...","description":"...","initialValue":0,"min":0,"max":5,"citations":["excerpt-id"]}],"startSuggestions":[{"chapterNumber":1,"label":"...","reason":"..."}]}. 最多 8 个驱动、8 个状态和 6 个起点。`;
+export const WORLD_SYNTHESIS_SYSTEM = `你是小说玩法设计师。把整本小说的资料摘要组织成一个符合这本书的互动故事模型，不得套用固定游戏类型。人物、关系、原著事件必须使用提供的资料和 excerpt id；允许的玩法状态只保留少量真正影响选择的变量，不要强行加入战斗或数值。每个玩法状态必须引用它首次有依据的原文片段；起点建议只选有引用证据的章节。面向玩家的 premise、tone 和 narrativeDrivers 必须是不暴露结局、身份反转或后期关键事件的无剧透描述。tone 必须是一个字符串，不要返回数组。角色 summary 只能描述该角色在 firstChapter 时已经公开的信息。返回 JSON: {"premise":"...","tone":"...","narrativeDrivers":["..."],"trackedStates":[{"id":"lower_snake_case","label":"...","description":"...","initialValue":0,"min":0,"max":5,"citations":["excerpt-id"]}],"startSuggestions":[{"chapterNumber":1,"label":"...","reason":"..."}]}. 最多 8 个驱动、8 个状态和 6 个起点。`;
 
 function compactSynthesisDigest(digest: ChunkDigest): Record<string, unknown> {
   return {

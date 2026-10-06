@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { ModelConfig } from './client';
-import { ModelRequestError, normalizeChatUrl, requestJson } from './client';
+import { ModelRequestError, normalizeChatUrl, requestJson, type ModelResponseDiagnostics } from './client';
 import { buildWorldExtractPrompt, buildWorldSynthesisPrompt, WORLD_EXTRACT_SYSTEM, WORLD_SYNTHESIS_SYSTEM, type ChunkDigest, type SourceExcerptContext } from './prompts';
 import type { ParsedNovel } from '../domain/novel';
 import { validateWorldModel, type WorldCharacter, type WorldFact, type WorldModel, type WorldRelationship, type WorldTimelineEvent } from '../domain/world';
@@ -12,7 +12,7 @@ export interface WorldBuildProgress {
   total: number;
   stage: 'reading' | 'synthesizing' | 'complete';
   status?: 'preparing' | 'requesting' | 'retrying' | 'validating' | 'saving' | 'saved' | 'synthesizing' | 'complete' | 'failed';
-  activeBatches?: Array<{ number: number; chapterLabel: string; status: 'requesting' | 'retrying' | 'validating' | 'saving'; attempt?: number; maxAttempts?: number; retryDelayMs?: number; estimatedTokens?: number; timeoutMs?: number; errorCode?: string }>;
+  activeBatches?: Array<{ number: number; chapterLabel: string; status: 'requesting' | 'retrying' | 'validating' | 'saving'; attempt?: number; maxAttempts?: number; retryDelayMs?: number; estimatedTokens?: number; timeoutMs?: number; errorCode?: string; finishReason?: string; responseChars?: number; invalidCitationCount?: number }>;
   resumed?: number;
   chapterCount?: number;
   startedAt?: number;
@@ -34,6 +34,13 @@ const EXTRACTION_CONCURRENCY = 4;
 const EXTRACTION_RETRIES = 2;
 const REQUEST_OVERHEAD_TOKENS = 512;
 
+function responseDiagnostics(diagnostics?: ModelResponseDiagnostics): Pick<WorldBuildEvent, 'finishReason' | 'responseChars'> {
+  return {
+    ...(diagnostics?.finishReason ? { finishReason: diagnostics.finishReason } : {}),
+    ...(diagnostics?.responseChars !== undefined ? { responseChars: diagnostics.responseChars } : {}),
+  };
+}
+
 export function getWorldRequestTimeoutMs(estimatedTokens: number): number {
   const contextSteps = Math.max(0, Math.ceil(estimatedTokens / 64_000) - 1);
   return Math.min(600_000, 180_000 + contextSteps * 60_000);
@@ -49,9 +56,14 @@ const ChunkDigestSchema = z.object({
   timeline: z.array(z.object({ description: z.string().min(1).max(500), chapterNumber: z.number().int().positive().optional(), citations: z.array(z.string().min(1)).min(1) }).strict()).max(8).default([]),
 }).strict();
 
+const SynthesisToneSchema = z.preprocess(
+  (value) => Array.isArray(value) && value.every((item) => typeof item === 'string') ? value.join('、') : value,
+  z.string().min(1).max(300),
+);
+
 const SynthesisSchema = z.object({
   premise: z.string().min(1).max(1_200),
-  tone: z.string().min(1).max(300),
+  tone: SynthesisToneSchema,
   narrativeDrivers: z.array(z.string().min(1).max(240)).min(1).max(8),
   trackedStates: z.array(z.object({ id: z.string(), label: z.string(), description: z.string(), initialValue: z.union([z.string(), z.number()]), min: z.number().optional(), max: z.number().optional(), citations: z.array(z.string().min(1)).min(1) }).strict()).max(8),
   startSuggestions: z.array(z.object({ chapterNumber: z.number().int().positive(), label: z.string().min(1).max(100), reason: z.string().min(1).max(240) }).strict()).min(1).max(6),
@@ -150,9 +162,12 @@ function checkpointSignature(novel: ParsedNovel, batches: WorldBatch[], config: 
   return `${(first >>> 0).toString(16).padStart(8, '0')}${(second >>> 0).toString(16).padStart(8, '0')}`;
 }
 
-function citationsFor(citations: string[], allowedIds: Set<string>): string[] {
-  for (const citation of citations) if (!allowedIds.has(citation)) throw new Error(`模型引用了本批次未提供的原文片段：${citation}`);
-  return [...new Set(citations)];
+function citationsFor(citations: string[], allowedIds: Set<string>, invalidCitations?: Set<string>): string[] {
+  return [...new Set(citations.filter((citation) => {
+    if (allowedIds.has(citation)) return true;
+    invalidCitations?.add(citation);
+    return false;
+  }))];
 }
 
 function chapterFor(citations: string[], chapterByExcerpt: Map<string, number>): number {
@@ -172,23 +187,27 @@ export async function buildWorld(
   const availableExcerptIds = batches.flatMap((batch) => batch.excerpts.map((excerpt) => excerpt.id));
   const excerptChapters = new Map<string, number>();
   for (const chapter of novel.chapters) for (const excerpt of chapter.excerpts) excerptChapters.set(excerpt.id, chapter.number);
-  const normalizeDigest = (parsed: z.infer<typeof ChunkDigestSchema>, batch: WorldBatch, chapterMap: Map<string, number>): ChunkDigest => {
+  const normalizeDigest = (parsed: z.infer<typeof ChunkDigestSchema>, batch: WorldBatch, chapterMap: Map<string, number>, invalidCitations?: Set<string>): ChunkDigest => {
     const allowed = new Set(batch.excerpts.map((excerpt) => excerpt.id));
     return {
       ...parsed,
-      characters: parsed.characters.map((character) => ({ ...character, citations: citationsFor(character.citations, allowed) })),
-      facts: parsed.facts.map((fact) => {
-        const citations = citationsFor(fact.citations, allowed);
+      characters: parsed.characters.flatMap((character) => {
+        const citations = citationsFor(character.citations, allowed, invalidCitations);
+        return citations.length ? [{ ...character, citations }] : [];
+      }),
+      facts: parsed.facts.flatMap((fact) => {
+        const citations = citationsFor(fact.citations, allowed, invalidCitations);
+        if (!citations.length) return [];
         if (fact.kind === 'inference' && fact.confidence === undefined) throw new Error('模型未为一条推断提供可信度。');
-        return { ...fact, chapterNumber: chapterFor(citations, chapterMap), citations };
+        return [{ ...fact, chapterNumber: chapterFor(citations, chapterMap), citations }];
       }),
-      relationships: parsed.relationships.map((relation) => {
-        const citations = citationsFor(relation.citations, allowed);
-        return { ...relation, chapterNumber: chapterFor(citations, chapterMap), citations };
+      relationships: parsed.relationships.flatMap((relation) => {
+        const citations = citationsFor(relation.citations, allowed, invalidCitations);
+        return citations.length ? [{ ...relation, chapterNumber: chapterFor(citations, chapterMap), citations }] : [];
       }),
-      timeline: parsed.timeline.map((event) => {
-        const citations = citationsFor(event.citations, allowed);
-        return { ...event, chapterNumber: chapterFor(citations, chapterMap), citations };
+      timeline: parsed.timeline.flatMap((event) => {
+        const citations = citationsFor(event.citations, allowed, invalidCitations);
+        return citations.length ? [{ ...event, chapterNumber: chapterFor(citations, chapterMap), citations }] : [];
       }),
     };
   };
@@ -317,6 +336,7 @@ export async function buildWorld(
   let nextBatchIndex = 0;
   let firstFailure: unknown;
   let firstFailureProgress: Pick<WorldBuildProgress, 'errorCode' | 'failedBatch'> | undefined;
+  let firstFailureEvent: WorldBuildEvent | undefined;
   const worker = async () => {
     while (!firstFailure) {
       while (nextBatchIndex < batches.length && digestByIndex[nextBatchIndex]) nextBatchIndex += 1;
@@ -344,16 +364,18 @@ export async function buildWorld(
               active.set(index, { number: batchNumber, chapterLabel, status: 'requesting', attempt: event.attempt, maxAttempts: event.maxAttempts, estimatedTokens: batch.estimatedTokens, timeoutMs });
               void reportEvent({ at: new Date().toISOString(), stage: 'reading', status: 'requesting', batchNumber, chapterLabel, attempt: event.attempt, maxAttempts: event.maxAttempts, estimatedTokens: batch.estimatedTokens, timeoutMs }).catch(() => undefined);
             } else if (event.type === 'retry-scheduled') {
-              active.set(index, { number: batchNumber, chapterLabel, status: 'retrying', attempt: event.attempt, maxAttempts: event.maxAttempts, retryDelayMs: event.delayMs, estimatedTokens: batch.estimatedTokens, timeoutMs, errorCode: event.code });
-              void reportEvent({ at: new Date().toISOString(), stage: 'reading', status: 'retrying', batchNumber, chapterLabel, attempt: event.attempt, maxAttempts: event.maxAttempts, estimatedTokens: batch.estimatedTokens, timeoutMs, errorCode: event.code }).catch(() => undefined);
+              const diagnostics = responseDiagnostics(event.diagnostics);
+              active.set(index, { number: batchNumber, chapterLabel, status: 'retrying', attempt: event.attempt, maxAttempts: event.maxAttempts, retryDelayMs: event.delayMs, estimatedTokens: batch.estimatedTokens, timeoutMs, errorCode: event.code, ...diagnostics });
+              void reportEvent({ at: new Date().toISOString(), stage: 'reading', status: 'retrying', batchNumber, chapterLabel, attempt: event.attempt, maxAttempts: event.maxAttempts, estimatedTokens: batch.estimatedTokens, timeoutMs, errorCode: event.code, ...diagnostics }).catch(() => undefined);
             }
           },
         });
         await persistTail;
         if (checkpointWriteError) throw checkpointWriteError;
-        active.set(index, { number: batchNumber, chapterLabel, status: 'validating', attempt: attempts, maxAttempts: EXTRACTION_RETRIES + 1, estimatedTokens: batch.estimatedTokens, timeoutMs });
-        await reportEvent({ at: new Date().toISOString(), stage: 'reading', status: 'validating', batchNumber, chapterLabel, attempt: attempts, maxAttempts: EXTRACTION_RETRIES + 1, estimatedTokens: batch.estimatedTokens, timeoutMs, durationMs: Date.now() - batchStartedAt });
-        const digest = normalizeDigest(ChunkDigestSchema.parse(raw), batch, excerptChapters);
+        const invalidCitationIds = new Set<string>();
+        const digest = normalizeDigest(ChunkDigestSchema.parse(raw), batch, excerptChapters, invalidCitationIds);
+        active.set(index, { number: batchNumber, chapterLabel, status: 'validating', attempt: attempts, maxAttempts: EXTRACTION_RETRIES + 1, estimatedTokens: batch.estimatedTokens, timeoutMs, invalidCitationCount: invalidCitationIds.size || undefined });
+        await reportEvent({ at: new Date().toISOString(), stage: 'reading', status: 'validating', batchNumber, chapterLabel, attempt: attempts, maxAttempts: EXTRACTION_RETRIES + 1, estimatedTokens: batch.estimatedTokens, timeoutMs, durationMs: Date.now() - batchStartedAt, invalidCitationCount: invalidCitationIds.size || undefined });
         digestByIndex[index] = [digest];
         if (checkpointStore) {
           active.set(index, { number: batchNumber, chapterLabel, status: 'saving', estimatedTokens: batch.estimatedTokens });
@@ -375,7 +397,8 @@ export async function buildWorld(
           firstFailure = error;
           const errorCode = error instanceof ModelRequestError ? error.code : error === checkpointWriteError ? 'local-storage' : 'validation';
           firstFailureProgress = { errorCode, failedBatch: { number: batchNumber, chapterLabel, errorCode } };
-          await reportEvent({ at: new Date().toISOString(), stage: 'reading', status: 'failed', batchNumber, chapterLabel, estimatedTokens: batch.estimatedTokens, durationMs: Date.now() - batchStartedAt, errorCode }).catch(() => undefined);
+          firstFailureEvent = { at: new Date().toISOString(), stage: 'reading', status: 'failed', batchNumber, chapterLabel, estimatedTokens: batch.estimatedTokens, durationMs: Date.now() - batchStartedAt, errorCode, ...responseDiagnostics(error instanceof ModelRequestError ? error.diagnostics : undefined) };
+          await reportEvent(firstFailureEvent).catch(() => undefined);
         }
       }
     }
@@ -383,6 +406,9 @@ export async function buildWorld(
   const workerCount = Math.min(EXTRACTION_CONCURRENCY, batches.length - resumed);
   await Promise.all(Array.from({ length: Math.max(0, workerCount) }, () => worker()));
   if (firstFailure) {
+    if (firstFailureEvent && events.at(-1)?.status !== 'failed') {
+      await reportEvent({ ...firstFailureEvent, at: new Date().toISOString() }).catch(() => undefined);
+    }
     emit({ stage: 'reading', status: 'failed', ...firstFailureProgress });
     throw firstFailure;
   }
@@ -402,7 +428,7 @@ export async function buildWorld(
       retry: { maxRetries: EXTRACTION_RETRIES, timeoutMs: synthesisTimeoutMs, baseDelayMs: 1_500, maxDelayMs: 12_000 },
       onProgress: (event) => {
         if (event.type === 'attempt-start') void reportEvent({ at: new Date().toISOString(), stage: 'synthesizing', status: 'synthesizing', batchNumber: batches.length + 1, chapterLabel: '全书汇总', attempt: event.attempt, maxAttempts: event.maxAttempts, estimatedTokens: synthesisEstimatedTokens, timeoutMs: synthesisTimeoutMs }, { completed: batches.length }).catch(() => undefined);
-        if (event.type === 'retry-scheduled') void reportEvent({ at: new Date().toISOString(), stage: 'synthesizing', status: 'retrying', batchNumber: batches.length + 1, chapterLabel: '全书汇总', attempt: event.attempt, maxAttempts: event.maxAttempts, estimatedTokens: synthesisEstimatedTokens, timeoutMs: synthesisTimeoutMs, errorCode: event.code }, { completed: batches.length, errorCode: event.code }).catch(() => undefined);
+        if (event.type === 'retry-scheduled') void reportEvent({ at: new Date().toISOString(), stage: 'synthesizing', status: 'retrying', batchNumber: batches.length + 1, chapterLabel: '全书汇总', attempt: event.attempt, maxAttempts: event.maxAttempts, estimatedTokens: synthesisEstimatedTokens, timeoutMs: synthesisTimeoutMs, errorCode: event.code, ...responseDiagnostics(event.diagnostics) }, { completed: batches.length, errorCode: event.code }).catch(() => undefined);
       },
     });
     await persistTail;
@@ -412,7 +438,7 @@ export async function buildWorld(
   } catch (error) {
     const errorCode = error instanceof ModelRequestError ? error.code : error === checkpointWriteError ? 'local-storage' : 'validation';
     const failedBatch = { number: batches.length + 1, chapterLabel: '全书汇总', errorCode };
-    await reportEvent({ at: new Date().toISOString(), stage: 'synthesizing', status: 'failed', batchNumber: batches.length + 1, chapterLabel: '全书汇总', estimatedTokens: synthesisEstimatedTokens, errorCode }, { completed: batches.length, failedBatch }).catch(() => undefined);
+    await reportEvent({ at: new Date().toISOString(), stage: 'synthesizing', status: 'failed', batchNumber: batches.length + 1, chapterLabel: '全书汇总', estimatedTokens: synthesisEstimatedTokens, errorCode, ...responseDiagnostics(error instanceof ModelRequestError ? error.diagnostics : undefined) }, { completed: batches.length, failedBatch }).catch(() => undefined);
     throw error;
   }
 
@@ -474,9 +500,9 @@ export async function buildWorld(
     facts: facts.slice(0, 500),
     relationships: [...relationMap.values()].filter((relation) => relation.characterIds.every((id) => characterIds.has(id))).slice(0, 300),
     timeline: timeline.slice(0, 300),
-    trackedStates: synthesis.trackedStates.map((state) => {
+    trackedStates: synthesis.trackedStates.flatMap((state) => {
       const citations = citationsFor(state.citations, new Set(availableExcerptIds));
-      return { ...state, sourceExcerptIds: citations, introducedChapter: chapterFor(citations, excerptChapters) };
+      return citations.length ? [{ ...state, sourceExcerptIds: citations, introducedChapter: chapterFor(citations, excerptChapters) }] : [];
     }),
     startSuggestions: synthesis.startSuggestions,
   }, novel);

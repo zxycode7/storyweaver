@@ -36,6 +36,9 @@ export interface WorldBuildEvent {
   timeoutMs?: number;
   durationMs?: number;
   errorCode?: string;
+  finishReason?: string;
+  responseChars?: number;
+  invalidCitationCount?: number;
 }
 
 function requestValue<T>(request: IDBRequest<T>): Promise<T> {

@@ -109,6 +109,27 @@ describe('model client', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it('retries truncated Grok JSON responses and requests structured JSON output', async () => {
+    const grokConfig = { ...config, model: 'grok-4-0709' };
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ finish_reason: 'length', message: { content: '{"ok":' } }] }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: '{"ok":true}' } }] }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const failures: Array<{ code: string; retryable: boolean; diagnostics?: { finishReason?: string; responseChars?: number } }> = [];
+
+    await expect(requestJson<{ ok: boolean }>(grokConfig, {
+      system: 'system', user: 'user', retry: { maxRetries: 1, baseDelayMs: 0 },
+      onProgress: (event) => { if (event.type === 'attempt-failed') failures.push(event); },
+    })).resolves.toEqual({ ok: true });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, firstInit] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const firstBody = JSON.parse(String(firstInit.body)) as { response_format?: unknown; max_tokens?: number };
+    expect(firstBody.response_format).toEqual({ type: 'json_object' });
+    expect(firstBody.max_tokens).toBeGreaterThanOrEqual(16_384);
+    expect(failures.map(({ code, diagnostics, retryable }) => ({ code, diagnostics, retryable }))).toEqual([{ code: 'malformed-response', diagnostics: { finishReason: 'length', responseChars: 6 }, retryable: true }]);
+  });
+
   it('distinguishes its own timeout from a user cancellation', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((_resolve, reject) => {

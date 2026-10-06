@@ -3,8 +3,8 @@ import { buildWorld, createWorldBatches, getWorldRequestTimeoutMs } from '../../
 import { parseNovelText } from '../../src/domain/novel';
 import type { ModelConfig } from '../../src/ai/client';
 import { buildWorldSynthesisPrompt, type ChunkDigest } from '../../src/ai/prompts';
-import { estimateModelTokens } from '../../src/ai/tokenEstimate';
-import type { WorldBuildCheckpoint } from '../../src/storage/storyRepository';
+import { estimateModelTokens, getWorldBatchTokenBudget } from '../../src/ai/tokenEstimate';
+import type { WorldBuildCheckpoint, WorldBuildEvent } from '../../src/storage/storyRepository';
 
 const config: ModelConfig = { baseUrl: 'https://api.example.test/v1', apiKey: 'secret', model: 'test' };
 
@@ -19,6 +19,10 @@ describe('buildWorld', () => {
     expect(getWorldRequestTimeoutMs(20_000)).toBe(180_000);
     expect(getWorldRequestTimeoutMs(192_000)).toBe(300_000);
     expect(getWorldRequestTimeoutMs(1_000_000)).toBe(600_000);
+  });
+
+  it('keeps input below the hard context boundary when a larger window is selected', () => {
+    expect(getWorldBatchTokenBudget(1_000_000)).toBeLessThanOrEqual(192_000);
   });
 
   it('reuses citation-valid saved digests after batch boundaries change', async () => {
@@ -149,7 +153,7 @@ describe('buildWorld', () => {
     const resumeConfig = { ...config, contextWindowTokens: 8_000 };
     const batches = createWorldBatches(novel, resumeConfig.contextWindowTokens);
     expect(batches).toHaveLength(2);
-    let saved: { id: string; novelId: string; signature: string; digests: Record<string, unknown>; updatedAt: string } | undefined;
+    let saved: { id: string; novelId: string; signature: string; digests: Record<string, unknown>; updatedAt: string; events?: WorldBuildEvent[] } | undefined;
     const store = {
       getWorldBuildCheckpoint: async () => saved,
       saveWorldBuildCheckpoint: async (checkpoint: NonNullable<typeof saved>) => { saved = checkpoint; },
@@ -185,6 +189,7 @@ describe('buildWorld', () => {
     const firstError = await buildWorld(novel, resumeConfig, (value) => progress.push(value), undefined, store).then(() => undefined, (error: unknown) => error);
     expect(firstError).toBeDefined();
     expect(saved).toBeDefined();
+    expect(saved?.events?.at(-1)?.status).toBe('failed');
     expect(progress.at(-1)).toMatchObject({ status: 'failed', failedBatch: { number: 2 } });
     failSecondBatch = false;
     await buildWorld(novel, resumeConfig, undefined, undefined, store);
@@ -230,6 +235,51 @@ describe('buildWorld', () => {
     expect(saved).toBeDefined();
     await store.deleteWorldBuildCheckpoint(`world-build-${novel.id}`);
     expect(saved).toBeUndefined();
+  });
+
+  it('drops an out-of-batch citation when the same extracted item has a valid source', async () => {
+    const novel = parseNovelText('第1章 相遇\n林遥经营旧书店。', 'citation-repair.txt');
+    let supportingExcerpt = '';
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const messages = JSON.parse(String(init.body)).messages as Array<{ role: string; content: string }>;
+      const system = messages.find((message) => message.role === 'system')?.content ?? '';
+      const user = messages.find((message) => message.role === 'user')?.content ?? '';
+      if (system.includes('小说资料分析器')) {
+        supportingExcerpt = user.match(/<source id="([^"]+)"/)?.[1] ?? '';
+        return response({
+          characters: [{ name: '林遥', summary: '经营旧书店。', citations: [supportingExcerpt, 'chapter-1067-5sw3wg-excerpt-1-1ajmngi'] }],
+          facts: [], relationships: [], timeline: [],
+        });
+      }
+      return response({ premise: '一段故事。', tone: '安静。', narrativeDrivers: ['关系'], trackedStates: [], startSuggestions: [{ chapterNumber: 1, label: '书店', reason: '故事刚开始。' }] });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const progress: Array<{ events?: Array<{ invalidCitationCount?: number }> }> = [];
+    const world = await buildWorld(novel, config, (value) => progress.push(value));
+
+    expect(world.characters[0].sourceExcerptIds).toEqual([supportingExcerpt]);
+    expect(progress.flatMap((value) => value.events ?? []).some((event) => event.invalidCitationCount === 1)).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('normalizes a list-shaped synthesis tone into the world tone string', async () => {
+    const novel = parseNovelText('第1章 相遇\n林遥经营旧书店。', 'tone-shape.txt');
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const messages = JSON.parse(String(init.body)).messages as Array<{ role: string; content: string }>;
+      const system = messages.find((message) => message.role === 'system')?.content ?? '';
+      const user = messages.find((message) => message.role === 'user')?.content ?? '';
+      if (system.includes('小说资料分析器')) {
+        const excerptId = user.match(/<source id="([^"]+)"/)?.[1] ?? 'missing';
+        return response({ characters: [{ name: '林遥', summary: '经营旧书店。', citations: [excerptId] }], facts: [], relationships: [], timeline: [] });
+      }
+      return response({ premise: '一段故事。', tone: ['克制', '温柔'], narrativeDrivers: ['关系'], trackedStates: [], startSuggestions: [{ chapterNumber: 1, label: '书店', reason: '故事刚开始。' }] });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const world = await buildWorld(novel, config);
+
+    expect(world.tone).toBe('克制、温柔');
   });
 
   it('keeps batches bounded and compiles cited facts into a playable world', async () => {
